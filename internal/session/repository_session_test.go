@@ -549,6 +549,7 @@ func TestRepository_AuthorizeConnect(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 
 	var testServer string
@@ -610,7 +611,7 @@ func TestRepository_AuthorizeConnect(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert, require := assert.New(t), require.New(t)
 
-			c, cs, authzInfo, err := repo.AuthorizeConnection(context.Background(), tt.session.PublicId, testServer)
+			c, cs, authzInfo, err := connRepo.AuthorizeConnection(context.Background(), tt.session.PublicId, testServer)
 			if tt.wantErr {
 				require.Error(err)
 				// TODO (jimlambrt 9/2020): add in tests for errorsIs once we
@@ -643,6 +644,7 @@ func TestRepository_ConnectConnection(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 
 	setupFn := func() ConnectWith {
@@ -736,7 +738,7 @@ func TestRepository_ConnectConnection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert, require := assert.New(t), require.New(t)
 
-			c, cs, err := repo.ConnectConnection(context.Background(), tt.connectWith)
+			c, cs, err := connRepo.ConnectConnection(context.Background(), tt.connectWith)
 			if tt.wantErr {
 				require.Error(err)
 				assert.Truef(errors.Match(errors.T(tt.wantIsError), err), "unexpected error %s", err.Error())
@@ -746,7 +748,7 @@ func TestRepository_ConnectConnection(t *testing.T) {
 			require.NotNil(c)
 			require.NotNil(cs)
 			assert.Equal(StatusConnected, cs[0].Status)
-			gotConn, _, err := repo.LookupConnection(context.Background(), c.PublicId)
+			gotConn, _, err := connRepo.LookupConnection(context.Background(), c.PublicId)
 			require.NoError(err)
 			assert.Equal(tt.connectWith.ClientTcpAddress, gotConn.ClientTcpAddress)
 			assert.Equal(tt.connectWith.ClientTcpPort, gotConn.ClientTcpPort)
@@ -766,6 +768,7 @@ func TestRepository_TerminateCompletedSessions(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 
 	setupFn := func(limit int32, expireIn time.Duration, leaveOpen bool) *Session {
@@ -788,7 +791,7 @@ func TestRepository_TerminateCompletedSessions(t *testing.T) {
 				BytesDown:    1,
 				ClosedReason: ConnectionClosedByUser,
 			}
-			_, err = repo.CloseConnections(context.Background(), []CloseWith{cw})
+			_, err = connRepo.CloseConnections(context.Background(), []CloseWith{cw})
 			require.NoError(t, err)
 		}
 		return s
@@ -967,10 +970,10 @@ func TestRepository_TerminateCompletedSessions(t *testing.T) {
 					}
 					assert.Equal(args.wantTermed[found.PublicId].String(), found.TerminationReason)
 					t.Logf("terminated %s has a connection limit of %d", found.PublicId, found.ConnectionLimit)
-					conn, err := repo.ListConnectionsBySessionId(context.Background(), found.PublicId)
+					conn, err := connRepo.ListConnectionsBySessionId(context.Background(), found.PublicId)
 					require.NoError(err)
 					for _, sc := range conn {
-						c, cs, err := repo.LookupConnection(context.Background(), sc.PublicId)
+						c, cs, err := connRepo.LookupConnection(context.Background(), sc.PublicId)
 						require.NoError(err)
 						assert.NotEmpty(c.ClosedReason)
 						for _, s := range cs {
@@ -980,7 +983,7 @@ func TestRepository_TerminateCompletedSessions(t *testing.T) {
 				} else {
 					t.Logf("not terminated %s has a connection limit of %d", found.PublicId, found.ConnectionLimit)
 					assert.Equal("", found.TerminationReason)
-					conn, err := repo.ListConnectionsBySessionId(context.Background(), found.PublicId)
+					conn, err := connRepo.ListConnectionsBySessionId(context.Background(), found.PublicId)
 					require.NoError(err)
 					for _, sc := range conn {
 						cs, err := fetchConnectionStates(context.Background(), rw, sc.PublicId)
@@ -1004,6 +1007,7 @@ func TestRepository_CloseConnections(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 
 	setupFn := func(cnt int) []CloseWith {
@@ -1059,7 +1063,7 @@ func TestRepository_CloseConnections(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert, require := assert.New(t), require.New(t)
-			resp, err := repo.CloseConnections(context.Background(), tt.closeWith)
+			resp, err := connRepo.CloseConnections(context.Background(), tt.closeWith)
 			if tt.wantErr {
 				require.Error(err)
 				assert.Truef(errors.Match(errors.T(tt.wantIsError), err), "unexpected error %s", err.Error())
@@ -1084,6 +1088,7 @@ func TestRepository_CancelSession(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 	setupFn := func() *Session {
 		session := TestDefaultSession(t, conn, wrapper, iamRepo)
@@ -1115,7 +1120,7 @@ func TestRepository_CancelSession(t *testing.T) {
 					BytesDown:    1,
 					ClosedReason: ConnectionClosedByUser,
 				}
-				_, err = repo.CloseConnections(context.Background(), []CloseWith{cw})
+				_, err = connRepo.CloseConnections(context.Background(), []CloseWith{cw})
 				require.NoError(t, err)
 				s, _, err := repo.LookupSession(context.Background(), session.PublicId)
 				require.NoError(t, err)

@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/hashicorp/boundary/internal/db/timestamp"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"strings"
 	"time"
 
@@ -11,6 +14,222 @@ import (
 	"github.com/hashicorp/boundary/internal/errors"
 	"github.com/hashicorp/boundary/internal/servers"
 )
+
+// AuthorizeConnection will check to see if a connection is allowed.  Currently,
+// that authorization checks:
+// * the hasn't expired based on the session.Expiration
+// * number of connections already created is less than session.ConnectionLimit
+// If authorization is success, it creates/stores a new connection in the repo
+// and returns it, along with its states.  If the authorization fails, it
+// an error with Code InvalidSessionState.
+func (r *ConnectionRepository) AuthorizeConnection(ctx context.Context, sessionId, workerId string) (*Connection, []*ConnectionState, *ConnectionAuthzSummary, error) {
+	const op = "session.(ConnectionRepository).AuthorizeConnection"
+	if sessionId == "" {
+		return nil, nil, nil, errors.Wrap(ctx, status.Error(codes.FailedPrecondition, "missing session id"), op, errors.WithCode(errors.InvalidParameter))
+	}
+	connectionId, err := newConnectionId()
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(ctx, err, op)
+	}
+
+	connection := AllocConnection()
+	connection.PublicId = connectionId
+	var connectionStates []*ConnectionState
+	_, err = r.writer.DoTx(
+		ctx,
+		db.StdRetryCnt,
+		db.ExpBackoff{},
+		func(reader db.Reader, w db.Writer) error {
+			rowsAffected, err := w.Exec(ctx, authorizeConnectionCte, []interface{}{
+				sql.Named("session_id", sessionId),
+				sql.Named("public_id", connectionId),
+				sql.Named("worker_id", workerId),
+			})
+			if err != nil {
+				return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("unable to authorize connection %s", sessionId)))
+			}
+			if rowsAffected == 0 {
+				return errors.Wrap(ctx, status.Errorf(codes.PermissionDenied, "session %s is not authorized (not active, expired or connection limit reached)", sessionId), op, errors.WithCode(errors.InvalidSessionState))
+			}
+			if err := reader.LookupById(ctx, &connection); err != nil {
+				return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("failed for session %s", sessionId)))
+			}
+			connectionStates, err = fetchConnectionStates(ctx, reader, connectionId, db.WithOrder("start_time desc"))
+			if err != nil {
+				return errors.Wrap(ctx, err, op)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(ctx, err, op)
+	}
+	authzSummary, err := r.sessionAuthzSummary(ctx, connection.SessionId)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(ctx, err, op)
+	}
+	return &connection, connectionStates, authzSummary, nil
+}
+
+type ConnectionAuthzSummary struct {
+	ExpirationTime         *timestamp.Timestamp
+	ConnectionLimit        int32
+	CurrentConnectionCount uint32
+}
+
+func (r *ConnectionRepository) sessionAuthzSummary(ctx context.Context, sessionId string) (*ConnectionAuthzSummary, error) {
+	const op = "session.(ConnectionRepository).sessionAuthzSummary"
+	rows, err := r.reader.Query(ctx, remainingConnectionsCte, []interface{}{sql.Named("session_id", sessionId)})
+	if err != nil {
+		return nil, errors.Wrap(ctx, err, op)
+	}
+	defer rows.Close()
+
+	var info *ConnectionAuthzSummary
+	for rows.Next() {
+		if info != nil {
+			return nil, errors.New(ctx, errors.MultipleRecords, op, "query returned more than one row")
+		}
+		info = &ConnectionAuthzSummary{}
+		if err := r.reader.ScanRows(ctx, rows, info); err != nil {
+			return nil, errors.Wrap(ctx, err, op, errors.WithMsg("scan row failed"))
+		}
+	}
+	return info, nil
+}
+
+// ConnectConnection updates a connection in the repo with a state of "connected".
+func (r *ConnectionRepository) ConnectConnection(ctx context.Context, c ConnectWith) (*Connection, []*ConnectionState, error) {
+	const op = "session.(ConnectionRepository).ConnectConnection"
+	// ConnectWith.validate will check all the fields...
+	if err := c.validate(); err != nil {
+		return nil, nil, errors.Wrap(ctx, err, op)
+	}
+	var connection Connection
+	var connectionStates []*ConnectionState
+	_, err := r.writer.DoTx(
+		ctx,
+		db.StdRetryCnt,
+		db.ExpBackoff{},
+		func(reader db.Reader, w db.Writer) error {
+			connection = AllocConnection()
+			connection.PublicId = c.ConnectionId
+			connection.ClientTcpAddress = c.ClientTcpAddress
+			connection.ClientTcpPort = c.ClientTcpPort
+			connection.EndpointTcpAddress = c.EndpointTcpAddress
+			connection.EndpointTcpPort = c.EndpointTcpPort
+			connection.UserClientIp = c.UserClientIp
+			fieldMask := []string{
+				"ClientTcpAddress",
+				"ClientTcpPort",
+				"EndpointTcpAddress",
+				"EndpointTcpPort",
+				"UserClientIp",
+			}
+			rowsUpdated, err := w.Update(ctx, &connection, fieldMask, nil)
+			if err != nil {
+				return errors.Wrap(ctx, err, op)
+			}
+			if err == nil && rowsUpdated > 1 {
+				// return err, which will result in a rollback of the update
+				return errors.New(ctx, errors.MultipleRecords, op, "more than 1 resource would have been updated")
+			}
+			newState, err := NewConnectionState(connection.PublicId, StatusConnected)
+			if err != nil {
+				return errors.Wrap(ctx, err, op)
+			}
+			if err := w.Create(ctx, newState); err != nil {
+				return errors.Wrap(ctx, err, op)
+			}
+			connectionStates, err = fetchConnectionStates(ctx, reader, c.ConnectionId, db.WithOrder("start_time desc"))
+			if err != nil {
+				return errors.Wrap(ctx, err, op)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, nil, errors.Wrap(ctx, err, op)
+	}
+	return &connection, connectionStates, nil
+}
+
+// CloseConnectionResp is just a wrapper for the response from CloseConnections.
+// It wraps the connection and its states for each connection closed.
+type CloseConnectionResp struct {
+	Connection       *Connection
+	ConnectionStates []*ConnectionState
+}
+
+// CloseConnections set's a connection's state to "closed" in the repo.  It's
+// called by a worker after it's closed a connection between the client and the
+// endpoint
+func (r *ConnectionRepository) CloseConnections(ctx context.Context, closeWith []CloseWith, _ ...Option) ([]CloseConnectionResp, error) {
+	const op = "session.(ConnectionRepository).CloseConnections"
+	if len(closeWith) == 0 {
+		return nil, errors.New(ctx, errors.InvalidParameter, op, "missing connections")
+	}
+	for _, cw := range closeWith {
+		if err := cw.validate(); err != nil {
+			return nil, errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("%s was invalid", cw.ConnectionId)))
+		}
+	}
+	var resp []CloseConnectionResp
+	_, err := r.writer.DoTx(
+		ctx,
+		db.StdRetryCnt,
+		db.ExpBackoff{},
+		func(reader db.Reader, w db.Writer) error {
+			for _, cw := range closeWith {
+				updateConnection := AllocConnection()
+				updateConnection.PublicId = cw.ConnectionId
+				updateConnection.BytesUp = cw.BytesUp
+				updateConnection.BytesDown = cw.BytesDown
+				updateConnection.ClosedReason = cw.ClosedReason.String()
+				// updating the ClosedReason will trigger an insert into the
+				// session_connection_state with a state of closed.
+				rowsUpdated, err := w.Update(
+					ctx,
+					&updateConnection,
+					[]string{"BytesUp", "BytesDown", "ClosedReason"},
+					nil,
+				)
+				if err != nil {
+					return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("unable to update connection %s", cw.ConnectionId)))
+				}
+				if rowsUpdated != 1 {
+					return errors.New(ctx, errors.MultipleRecords, op, fmt.Sprintf("%d would have been updated for connection %s", rowsUpdated, cw.ConnectionId))
+				}
+				states, err := fetchConnectionStates(ctx, reader, cw.ConnectionId, db.WithOrder("start_time desc"))
+				if err != nil {
+					return errors.Wrap(ctx, err, op)
+				}
+				resp = append(resp, CloseConnectionResp{
+					Connection:       &updateConnection,
+					ConnectionStates: states,
+				})
+
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, errors.Wrap(ctx, err, op)
+	}
+	return resp, nil
+}
+
+func fetchConnections(ctx context.Context, r db.Reader, sessionId string, opt ...db.Option) ([]*Connection, error) {
+	const op = "session.fetchConnections"
+	var connections []*Connection
+	if err := r.SearchWhere(ctx, &connections, "session_id = ?", []interface{}{sessionId}, opt...); err != nil {
+		return nil, errors.Wrap(ctx, err, op)
+	}
+	if len(connections) == 0 {
+		return nil, nil
+	}
+	return connections, nil
+}
 
 // deadWorkerConnCloseMinGrace is the minimum allowable setting for
 // the CloseConnectionsForDeadWorkers method. This is synced with
@@ -20,8 +239,8 @@ var DeadWorkerConnCloseMinGrace = int(servers.DefaultLiveness.Seconds())
 // LookupConnection will look up a connection in the repository and return the connection
 // with its states. If the connection is not found, it will return nil, nil, nil.
 // No options are currently supported.
-func (r *Repository) LookupConnection(ctx context.Context, connectionId string, _ ...Option) (*Connection, []*ConnectionState, error) {
-	const op = "session.(Repository).LookupConnection"
+func (r *ConnectionRepository) LookupConnection(ctx context.Context, connectionId string, _ ...Option) (*Connection, []*ConnectionState, error) {
+	const op = "session.(ConnectionRepository).LookupConnection"
 	if connectionId == "" {
 		return nil, nil, errors.New(ctx, errors.InvalidParameter, op, "missing connectionId id")
 	}
@@ -54,8 +273,8 @@ func (r *Repository) LookupConnection(ctx context.Context, connectionId string, 
 
 // ListConnectionsBySessionId will list connections by session ID. Supports the
 // WithLimit and WithOrder options.
-func (r *Repository) ListConnectionsBySessionId(ctx context.Context, sessionId string, opt ...Option) ([]*Connection, error) {
-	const op = "session.(Repository).ListConnectionsBySessionId"
+func (r *ConnectionRepository) ListConnectionsBySessionId(ctx context.Context, sessionId string, opt ...Option) ([]*Connection, error) {
+	const op = "session.(ConnectionRepository).ListConnectionsBySessionId"
 	if sessionId == "" {
 		return nil, errors.New(ctx, errors.InvalidParameter, op, "no session ID supplied")
 	}
@@ -68,8 +287,8 @@ func (r *Repository) ListConnectionsBySessionId(ctx context.Context, sessionId s
 }
 
 // DeleteConnection will delete a connection from the repository.
-func (r *Repository) DeleteConnection(ctx context.Context, publicId string, _ ...Option) (int, error) {
-	const op = "session.(Repository).DeleteConnection"
+func (r *ConnectionRepository) DeleteConnection(ctx context.Context, publicId string, _ ...Option) (int, error) {
+	const op = "session.(ConnectionRepository).DeleteConnection"
 	if publicId == "" {
 		return db.NoRowsAffected, errors.New(ctx, errors.InvalidParameter, op, "missing public id")
 	}
@@ -115,8 +334,8 @@ func (r *Repository) DeleteConnection(ctx context.Context, publicId string, _ ..
 // uses a NOT IN clause to ensure these are excluded. It is not an error for
 // this to be empty as the worker could claim no connections; in that case all
 // connections will immediately transition to closed.
-func (r *Repository) CloseDeadConnectionsForWorker(ctx context.Context, serverId string, foundConns []string) (int, error) {
-	const op = "session.(Repository).CloseDeadConnectionsForWorker"
+func (r *ConnectionRepository) CloseDeadConnectionsForWorker(ctx context.Context, serverId string, foundConns []string) (int, error) {
+	const op = "session.(ConnectionRepository).CloseDeadConnectionsForWorker"
 	if serverId == "" {
 		return db.NoRowsAffected, errors.New(ctx, errors.InvalidParameter, op, "missing server id")
 	}
@@ -166,8 +385,8 @@ type CloseConnectionsForDeadWorkersResult struct {
 // sending status updates to the controller(s).
 //
 // The only input to the method is the grace period, in seconds.
-func (r *Repository) CloseConnectionsForDeadWorkers(ctx context.Context, gracePeriod int) ([]CloseConnectionsForDeadWorkersResult, error) {
-	const op = "session.(Repository).CloseConnectionsForDeadWorkers"
+func (r *ConnectionRepository) CloseConnectionsForDeadWorkers(ctx context.Context, gracePeriod int) ([]CloseConnectionsForDeadWorkersResult, error) {
+	const op = "session.(ConnectionRepository).CloseConnectionsForDeadWorkers"
 	if gracePeriod < DeadWorkerConnCloseMinGrace {
 		return nil, errors.New(ctx,
 			errors.InvalidParameter, op, fmt.Sprintf("gracePeriod must be at least %d seconds", DeadWorkerConnCloseMinGrace))
@@ -214,8 +433,8 @@ func (r *Repository) CloseConnectionsForDeadWorkers(ctx context.Context, gracePe
 // them again would be redundant.
 //
 // The returned map[string][]string is indexed by session ID.
-func (r *Repository) ShouldCloseConnectionsOnWorker(ctx context.Context, foundConns, filterSessions []string) (map[string][]string, error) {
-	const op = "session.(Repository).ShouldCloseConnectionsOnWorker"
+func (r *ConnectionRepository) ShouldCloseConnectionsOnWorker(ctx context.Context, foundConns, filterSessions []string) (map[string][]string, error) {
+	const op = "session.(ConnectionRepository).ShouldCloseConnectionsOnWorker"
 	if len(foundConns) < 1 {
 		return nil, nil // nothing to do
 	}

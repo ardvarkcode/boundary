@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hashicorp/boundary/internal/session"
 	"net"
 	"strconv"
 	"strings"
@@ -110,6 +111,14 @@ func (tc *TestController) AuthTokenRepo() *authtoken.Repository {
 
 func (tc *TestController) ServersRepo() *servers.Repository {
 	repo, err := tc.c.ServersRepoFn()
+	if err != nil {
+		tc.t.Fatal(err)
+	}
+	return repo
+}
+
+func (tc *TestController) ConnectionsRepo() *session.ConnectionRepository {
+	repo, err := tc.c.ConnectionRepoFn()
 	if err != nil {
 		tc.t.Fatal(err)
 	}

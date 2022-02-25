@@ -9,12 +9,9 @@ import (
 	"strings"
 
 	"github.com/hashicorp/boundary/internal/db"
-	"github.com/hashicorp/boundary/internal/db/timestamp"
 	"github.com/hashicorp/boundary/internal/errors"
 	"github.com/hashicorp/boundary/internal/kms"
 	wrapping "github.com/hashicorp/go-kms-wrapping"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // CreateSession inserts into the repository and returns the new Session with
@@ -377,68 +374,6 @@ func (r *Repository) TerminateCompletedSessions(ctx context.Context) (int, error
 	return rowsAffected, nil
 }
 
-// AuthorizeConnection will check to see if a connection is allowed.  Currently,
-// that authorization checks:
-// * the hasn't expired based on the session.Expiration
-// * number of connections already created is less than session.ConnectionLimit
-// If authorization is success, it creates/stores a new connection in the repo
-// and returns it, along with its states.  If the authorization fails, it
-// an error with Code InvalidSessionState.
-func (r *Repository) AuthorizeConnection(ctx context.Context, sessionId, workerId string) (*Connection, []*ConnectionState, *ConnectionAuthzSummary, error) {
-	const op = "session.(Repository).AuthorizeConnection"
-	if sessionId == "" {
-		return nil, nil, nil, errors.Wrap(ctx, status.Error(codes.FailedPrecondition, "missing session id"), op, errors.WithCode(errors.InvalidParameter))
-	}
-	connectionId, err := newConnectionId()
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(ctx, err, op)
-	}
-
-	connection := AllocConnection()
-	connection.PublicId = connectionId
-	var connectionStates []*ConnectionState
-	_, err = r.writer.DoTx(
-		ctx,
-		db.StdRetryCnt,
-		db.ExpBackoff{},
-		func(reader db.Reader, w db.Writer) error {
-			rowsAffected, err := w.Exec(ctx, authorizeConnectionCte, []interface{}{
-				sql.Named("session_id", sessionId),
-				sql.Named("public_id", connectionId),
-				sql.Named("worker_id", workerId),
-			})
-			if err != nil {
-				return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("unable to authorize connection %s", sessionId)))
-			}
-			if rowsAffected == 0 {
-				return errors.Wrap(ctx, status.Errorf(codes.PermissionDenied, "session %s is not authorized (not active, expired or connection limit reached)", sessionId), op, errors.WithCode(errors.InvalidSessionState))
-			}
-			if err := reader.LookupById(ctx, &connection); err != nil {
-				return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("failed for session %s", sessionId)))
-			}
-			connectionStates, err = fetchConnectionStates(ctx, reader, connectionId, db.WithOrder("start_time desc"))
-			if err != nil {
-				return errors.Wrap(ctx, err, op)
-			}
-			return nil
-		},
-	)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(ctx, err, op)
-	}
-	authzSummary, err := r.sessionAuthzSummary(ctx, connection.SessionId)
-	if err != nil {
-		return nil, nil, nil, errors.Wrap(ctx, err, op)
-	}
-	return &connection, connectionStates, authzSummary, nil
-}
-
-type ConnectionAuthzSummary struct {
-	ExpirationTime         *timestamp.Timestamp
-	ConnectionLimit        int32
-	CurrentConnectionCount uint32
-}
-
 func (r *Repository) sessionAuthzSummary(ctx context.Context, sessionId string) (*ConnectionAuthzSummary, error) {
 	const op = "session.(Repository).sessionAuthzSummary"
 	rows, err := r.reader.Query(ctx, remainingConnectionsCte, []interface{}{sql.Named("session_id", sessionId)})
@@ -458,127 +393,6 @@ func (r *Repository) sessionAuthzSummary(ctx context.Context, sessionId string) 
 		}
 	}
 	return info, nil
-}
-
-// ConnectConnection updates a connection in the repo with a state of "connected".
-func (r *Repository) ConnectConnection(ctx context.Context, c ConnectWith) (*Connection, []*ConnectionState, error) {
-	const op = "session.(Repository).ConnectConnection"
-	// ConnectWith.validate will check all the fields...
-	if err := c.validate(); err != nil {
-		return nil, nil, errors.Wrap(ctx, err, op)
-	}
-	var connection Connection
-	var connectionStates []*ConnectionState
-	_, err := r.writer.DoTx(
-		ctx,
-		db.StdRetryCnt,
-		db.ExpBackoff{},
-		func(reader db.Reader, w db.Writer) error {
-			connection = AllocConnection()
-			connection.PublicId = c.ConnectionId
-			connection.ClientTcpAddress = c.ClientTcpAddress
-			connection.ClientTcpPort = c.ClientTcpPort
-			connection.EndpointTcpAddress = c.EndpointTcpAddress
-			connection.EndpointTcpPort = c.EndpointTcpPort
-			connection.UserClientIp = c.UserClientIp
-			fieldMask := []string{
-				"ClientTcpAddress",
-				"ClientTcpPort",
-				"EndpointTcpAddress",
-				"EndpointTcpPort",
-				"UserClientIp",
-			}
-			rowsUpdated, err := w.Update(ctx, &connection, fieldMask, nil)
-			if err != nil {
-				return errors.Wrap(ctx, err, op)
-			}
-			if err == nil && rowsUpdated > 1 {
-				// return err, which will result in a rollback of the update
-				return errors.New(ctx, errors.MultipleRecords, op, "more than 1 resource would have been updated")
-			}
-			newState, err := NewConnectionState(connection.PublicId, StatusConnected)
-			if err != nil {
-				return errors.Wrap(ctx, err, op)
-			}
-			if err := w.Create(ctx, newState); err != nil {
-				return errors.Wrap(ctx, err, op)
-			}
-			connectionStates, err = fetchConnectionStates(ctx, reader, c.ConnectionId, db.WithOrder("start_time desc"))
-			if err != nil {
-				return errors.Wrap(ctx, err, op)
-			}
-			return nil
-		},
-	)
-	if err != nil {
-		return nil, nil, errors.Wrap(ctx, err, op)
-	}
-	return &connection, connectionStates, nil
-}
-
-// CloseConnectionResp is just a wrapper for the response from CloseConnections.
-// It wraps the connection and its states for each connection closed.
-type CloseConnectionResp struct {
-	Connection       *Connection
-	ConnectionStates []*ConnectionState
-}
-
-// CloseConnections set's a connection's state to "closed" in the repo.  It's
-// called by a worker after it's closed a connection between the client and the
-// endpoint
-func (r *Repository) CloseConnections(ctx context.Context, closeWith []CloseWith, _ ...Option) ([]CloseConnectionResp, error) {
-	const op = "session.(Repository).CloseConnections"
-	if len(closeWith) == 0 {
-		return nil, errors.New(ctx, errors.InvalidParameter, op, "missing connections")
-	}
-	for _, cw := range closeWith {
-		if err := cw.validate(); err != nil {
-			return nil, errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("%s was invalid", cw.ConnectionId)))
-		}
-	}
-	var resp []CloseConnectionResp
-	_, err := r.writer.DoTx(
-		ctx,
-		db.StdRetryCnt,
-		db.ExpBackoff{},
-		func(reader db.Reader, w db.Writer) error {
-			for _, cw := range closeWith {
-				updateConnection := AllocConnection()
-				updateConnection.PublicId = cw.ConnectionId
-				updateConnection.BytesUp = cw.BytesUp
-				updateConnection.BytesDown = cw.BytesDown
-				updateConnection.ClosedReason = cw.ClosedReason.String()
-				// updating the ClosedReason will trigger an insert into the
-				// session_connection_state with a state of closed.
-				rowsUpdated, err := w.Update(
-					ctx,
-					&updateConnection,
-					[]string{"BytesUp", "BytesDown", "ClosedReason"},
-					nil,
-				)
-				if err != nil {
-					return errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("unable to update connection %s", cw.ConnectionId)))
-				}
-				if rowsUpdated != 1 {
-					return errors.New(ctx, errors.MultipleRecords, op, fmt.Sprintf("%d would have been updated for connection %s", rowsUpdated, cw.ConnectionId))
-				}
-				states, err := fetchConnectionStates(ctx, reader, cw.ConnectionId, db.WithOrder("start_time desc"))
-				if err != nil {
-					return errors.Wrap(ctx, err, op)
-				}
-				resp = append(resp, CloseConnectionResp{
-					Connection:       &updateConnection,
-					ConnectionStates: states,
-				})
-
-			}
-			return nil
-		},
-	)
-	if err != nil {
-		return nil, errors.Wrap(ctx, err, op)
-	}
-	return resp, nil
 }
 
 // ActivateSession will activate the session and is called by a worker after
@@ -748,16 +562,4 @@ func fetchStates(ctx context.Context, r db.Reader, sessionId string, opt ...db.O
 		return nil, nil
 	}
 	return states, nil
-}
-
-func fetchConnections(ctx context.Context, r db.Reader, sessionId string, opt ...db.Option) ([]*Connection, error) {
-	const op = "session.fetchConnections"
-	var connections []*Connection
-	if err := r.SearchWhere(ctx, &connections, "session_id = ?", []interface{}{sessionId}, opt...); err != nil {
-		return nil, errors.Wrap(ctx, err, op)
-	}
-	if len(connections) == 0 {
-		return nil, nil
-	}
-	return connections, nil
 }

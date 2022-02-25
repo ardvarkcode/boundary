@@ -26,6 +26,7 @@ func TestRepository_ListConnection(t *testing.T) {
 	rw := db.New(conn)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms, WithLimit(testLimit))
+	connRepo, err := NewConnectionRepository(rw, rw, kms, WithLimit(testLimit))
 	require.NoError(t, err)
 	session := TestDefaultSession(t, conn, wrapper, iamRepo)
 
@@ -96,7 +97,7 @@ func TestRepository_ListConnection(t *testing.T) {
 				testConnections = append(testConnections, c)
 			}
 			assert.Equal(tt.createCnt, len(testConnections))
-			got, err := repo.ListConnectionsBySessionId(context.Background(), tt.args.searchForSessionId, tt.args.opt...)
+			got, err := connRepo.ListConnectionsBySessionId(context.Background(), tt.args.searchForSessionId, tt.args.opt...)
 			if tt.wantErr {
 				require.Error(err)
 				return
@@ -119,7 +120,7 @@ func TestRepository_ListConnection(t *testing.T) {
 				"127.0.0.1",
 			)
 		}
-		got, err := repo.ListConnectionsBySessionId(context.Background(), session.PublicId, WithOrderByCreateTime(db.AscendingOrderBy))
+		got, err := connRepo.ListConnectionsBySessionId(context.Background(), session.PublicId, WithOrderByCreateTime(db.AscendingOrderBy))
 		require.NoError(err)
 		assert.Equal(wantCnt, len(got))
 
@@ -138,7 +139,7 @@ func TestRepository_DeleteConnection(t *testing.T) {
 	wrapper := db.TestWrapper(t)
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
-	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(t, err)
 	session := TestDefaultSession(t, conn, wrapper, iamRepo)
 
@@ -171,7 +172,7 @@ func TestRepository_DeleteConnection(t *testing.T) {
 			},
 			wantRowsDeleted: 0,
 			wantErr:         true,
-			wantErrMsg:      "session.(Repository).DeleteConnection: missing public id: parameter violation: error #100",
+			wantErrMsg:      "session.(ConnectionRepository).DeleteConnection: missing public id: parameter violation: error #100",
 		},
 		{
 			name: "not-found",
@@ -192,7 +193,7 @@ func TestRepository_DeleteConnection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
-			deletedRows, err := repo.DeleteConnection(context.Background(), tt.args.connection.PublicId, tt.args.opt...)
+			deletedRows, err := connRepo.DeleteConnection(context.Background(), tt.args.connection.PublicId, tt.args.opt...)
 			if tt.wantErr {
 				assert.Error(err)
 				assert.Equal(0, deletedRows)
@@ -204,7 +205,7 @@ func TestRepository_DeleteConnection(t *testing.T) {
 			}
 			assert.NoError(err)
 			assert.Equal(tt.wantRowsDeleted, deletedRows)
-			found, _, err := repo.LookupConnection(context.Background(), tt.args.connection.PublicId)
+			found, _, err := connRepo.LookupConnection(context.Background(), tt.args.connection.PublicId)
 			assert.NoError(err)
 			assert.Nil(found)
 
@@ -223,6 +224,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(err)
 	ctx := context.Background()
 	numConns := 12
@@ -243,7 +245,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 		sess := TestDefaultSession(t, conn, wrapper, iamRepo, WithServerId(serverId), WithDbOpts(db.WithSkipVetForWrite(true)))
 		sess, _, err = repo.ActivateSession(ctx, sess.GetPublicId(), sess.Version, serverId, "worker", []byte("foo"))
 		require.NoError(err)
-		c, cs, _, err := repo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
+		c, cs, _, err := connRepo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
 		require.NoError(err)
 		require.Len(cs, 1)
 		require.Equal(StatusAuthorized, cs[0].Status)
@@ -257,7 +259,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	// This is just to ensure we have a spread when we test it out.
 	for i, connId := range connIds {
 		if i%2 == 0 {
-			_, cs, err := repo.ConnectConnection(ctx, ConnectWith{
+			_, cs, err := connRepo.ConnectConnection(ctx, ConnectWith{
 				ConnectionId:       connId,
 				ClientTcpAddress:   "127.0.0.1",
 				ClientTcpPort:      22,
@@ -289,7 +291,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	// all connection IDs for worker 1 should be showing as non-closed, and
 	// the ones for worker 2 not advertised should be closed.
 	shouldStayOpen := worker2ConnIds[0:2]
-	count, err := repo.CloseDeadConnectionsForWorker(ctx, worker2.GetPrivateId(), shouldStayOpen)
+	count, err := connRepo.CloseDeadConnectionsForWorker(ctx, worker2.GetPrivateId(), shouldStayOpen)
 	require.NoError(err)
 	assert.Equal(4, count)
 
@@ -300,7 +302,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	var conns []*Connection
 	require.NoError(repo.list(ctx, &conns, "", nil))
 	for _, conn := range conns {
-		_, states, err := repo.LookupConnection(ctx, conn.PublicId)
+		_, states, err := connRepo.LookupConnection(ctx, conn.PublicId)
 		require.NoError(err)
 		var foundClosed bool
 		for _, state := range states {
@@ -315,7 +317,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	// Now, advertise none of the connection IDs for worker 2. This is mainly to
 	// test that handling the case where we do not include IDs works properly as
 	// it changes the where clause.
-	count, err = repo.CloseDeadConnectionsForWorker(ctx, worker1.GetPrivateId(), nil)
+	count, err = connRepo.CloseDeadConnectionsForWorker(ctx, worker1.GetPrivateId(), nil)
 	require.NoError(err)
 	assert.Equal(6, count)
 
@@ -323,7 +325,7 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 	conns = nil
 	require.NoError(repo.list(ctx, &conns, "", nil))
 	for _, conn := range conns {
-		_, states, err := repo.LookupConnection(ctx, conn.PublicId)
+		_, states, err := connRepo.LookupConnection(ctx, conn.PublicId)
 		require.NoError(err)
 		var foundClosed bool
 		for _, state := range states {
@@ -345,6 +347,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(err)
 	serversRepo, err := servers.NewRepository(rw, rw, kms)
 	require.NoError(err)
@@ -377,7 +380,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		sess := TestDefaultSession(t, conn, wrapper, iamRepo, WithServerId(serverId), WithDbOpts(db.WithSkipVetForWrite(true)))
 		sess, _, err = repo.ActivateSession(ctx, sess.GetPublicId(), sess.Version, serverId, "worker", []byte("foo"))
 		require.NoError(err)
-		c, cs, _, err := repo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
+		c, cs, _, err := connRepo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
 		require.NoError(err)
 		require.Len(cs, 1)
 		require.Equal(StatusAuthorized, cs[0].Status)
@@ -401,7 +404,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		return s
 	}() {
 		if i%3 == 0 {
-			_, cs, err := repo.ConnectConnection(ctx, ConnectWith{
+			_, cs, err := connRepo.ConnectConnection(ctx, ConnectWith{
 				ConnectionId:       connId,
 				ClientTcpAddress:   "127.0.0.1",
 				ClientTcpPort:      22,
@@ -423,7 +426,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 			require.True(foundAuthorized)
 			require.True(foundConnected)
 		} else if i%3 == 1 {
-			resp, err := repo.CloseConnections(ctx, []CloseWith{
+			resp, err := connRepo.CloseConnections(ctx, []CloseWith{
 				{
 					ConnectionId: connId,
 					ClosedReason: ConnectionCanceled,
@@ -496,7 +499,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 				expected = StatusAuthorized
 			}
 
-			_, states, err := repo.LookupConnection(ctx, connId)
+			_, states, err := connRepo.LookupConnection(ctx, connId)
 			require.NoError(err)
 			require.Equal(expected, states[0].Status, "expected latest status for %q (index %d) to be %v", connId, i, expected)
 		}
@@ -515,10 +518,10 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 	// Now try some scenarios.
 	{
 		// First, test the error/validation case.
-		result, err := repo.CloseConnectionsForDeadWorkers(ctx, 0)
+		result, err := connRepo.CloseConnectionsForDeadWorkers(ctx, 0)
 		require.Equal(err, errors.E(ctx,
 			errors.WithCode(errors.InvalidParameter),
-			errors.WithOp("session.(Repository).CloseConnectionsForDeadWorkers"),
+			errors.WithOp("session.(ConnectionRepository).CloseConnectionsForDeadWorkers"),
 			errors.WithMsg(fmt.Sprintf("gracePeriod must be at least %d seconds", DeadWorkerConnCloseMinGrace)),
 		))
 		require.Nil(result)
@@ -531,7 +534,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		worker3 = updateServer(t, worker3)
 		updateServer(t, worker4) // no re-assignment here because we never reference the server again
 
-		result, err := repo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
+		result, err := connRepo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
 		require.NoError(err)
 		require.Empty(result)
 		// Expect appropriate split connection state on worker1
@@ -551,7 +554,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		worker2 = updateServer(t, worker2)
 		worker3 = updateServer(t, worker3)
 
-		result, err := repo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
+		result, err := connRepo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
 		require.NoError(err)
 		require.Empty(result)
 		// Expect appropriate split connection state on worker1
@@ -569,7 +572,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		worker2 = updateServer(t, worker2)
 		worker3 = updateServer(t, worker3)
 
-		result, err := repo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
+		result, err := connRepo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
 		require.NoError(err)
 		// Assert that we have one result with the appropriate ID and
 		// number of connections closed. Due to how things are
@@ -594,7 +597,7 @@ func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
 		// appropriate message from the next two servers acted on.
 		time.Sleep(time.Second * time.Duration(DeadWorkerConnCloseMinGrace))
 
-		result, err := repo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
+		result, err := connRepo.CloseConnectionsForDeadWorkers(ctx, DeadWorkerConnCloseMinGrace)
 		require.NoError(err)
 		// Assert that we have one result with the appropriate ID and number of connections closed.
 		require.Equal([]CloseConnectionsForDeadWorkersResult{
@@ -627,6 +630,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 	iamRepo := iam.TestRepo(t, conn, wrapper)
 	kms := kms.TestKms(t, conn, wrapper)
 	repo, err := NewRepository(rw, rw, kms)
+	connRepo, err := NewConnectionRepository(rw, rw, kms)
 	require.NoError(err)
 	ctx := context.Background()
 	numConns := 12
@@ -644,7 +648,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 		sessionId := sess.GetPublicId()
 		sess, _, err = repo.ActivateSession(ctx, sessionId, sess.Version, serverId, "worker", []byte("foo"))
 		require.NoError(err)
-		c, cs, _, err := repo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
+		c, cs, _, err := connRepo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
 		require.NoError(err)
 		require.Len(cs, 1)
 		require.Equal(StatusAuthorized, cs[0].Status)
@@ -656,7 +660,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 	// Mark half of the connections connected, close the other half.
 	for i, connId := range connIds {
 		if i%2 == 0 {
-			_, cs, err := repo.ConnectConnection(ctx, ConnectWith{
+			_, cs, err := connRepo.ConnectConnection(ctx, ConnectWith{
 				ConnectionId:       connId,
 				ClientTcpAddress:   "127.0.0.1",
 				ClientTcpPort:      22,
@@ -678,7 +682,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 			require.True(foundAuthorized)
 			require.True(foundConnected)
 		} else {
-			resp, err := repo.CloseConnections(ctx, []CloseWith{
+			resp, err := connRepo.CloseConnections(ctx, []CloseWith{
 				{
 					ConnectionId: connId,
 					ClosedReason: ConnectionCanceled,
@@ -709,7 +713,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 	// Now we try some scenarios.
 	{
 		// First test an empty set.
-		result, err := repo.ShouldCloseConnectionsOnWorker(ctx, nil, nil)
+		result, err := connRepo.ShouldCloseConnectionsOnWorker(ctx, nil, nil)
 		require.NoError(err)
 		require.Zero(result, "should be empty when no connections are supplied")
 	}
@@ -724,14 +728,14 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 		expectedSessionConnIds := make(map[string][]string)
 		for sessionId, connIds := range sessionConnIds {
 			for _, connId := range connIds {
-				if testIsConnectionClosed(ctx, t, repo, connId) {
+				if testIsConnectionClosed(ctx, t, connRepo, connId) {
 					expectedSessionConnIds[sessionId] = append(expectedSessionConnIds[sessionId], connId)
 				}
 			}
 		}
 
 		// Send query, use all connections w/o a filter on sessions.
-		actualSessionConnIds, err := repo.ShouldCloseConnectionsOnWorker(ctx, connIds, nil)
+		actualSessionConnIds, err := connRepo.ShouldCloseConnectionsOnWorker(ctx, connIds, nil)
 		require.NoError(err)
 		require.Equal(expectedSessionConnIds, actualSessionConnIds)
 	}
@@ -744,7 +748,7 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 		var filterSession bool
 		for sessionId, connIds := range sessionConnIds {
 			for _, connId := range connIds {
-				if testIsConnectionClosed(ctx, t, repo, connId) {
+				if testIsConnectionClosed(ctx, t, connRepo, connId) {
 					if !filterSession {
 						expectedSessionConnIds[sessionId] = append(expectedSessionConnIds[sessionId], connId)
 					} else {
@@ -760,13 +764,13 @@ func TestRepository_ShouldCloseConnectionsOnWorker(t *testing.T) {
 		}
 
 		// Send query with the session filter.
-		actualSessionConnIds, err := repo.ShouldCloseConnectionsOnWorker(ctx, connIds, filterSessionIds)
+		actualSessionConnIds, err := connRepo.ShouldCloseConnectionsOnWorker(ctx, connIds, filterSessionIds)
 		require.NoError(err)
 		require.Equal(expectedSessionConnIds, actualSessionConnIds)
 	}
 }
 
-func testIsConnectionClosed(ctx context.Context, t *testing.T, repo *Repository, connId string) bool {
+func testIsConnectionClosed(ctx context.Context, t *testing.T, repo *ConnectionRepository, connId string) bool {
 	require := require.New(t)
 	_, states, err := repo.LookupConnection(ctx, connId)
 	require.NoError(err)
