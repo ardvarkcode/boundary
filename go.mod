@@ -88,7 +88,7 @@ require github.com/hashicorp/go-dbw v0.0.0-20211215222256-2ff0d37184ff // this i
 
 require (
 	github.com/hashicorp/go-sockaddr v1.0.2
-	golang.org/x/sys v0.0.0-20211210111614-af8b64212486
+	golang.org/x/sys v0.1.0
 )
 
 require (
